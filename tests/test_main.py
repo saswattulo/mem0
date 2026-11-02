@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from mem0.configs.base import MemoryConfig
-from mem0.memory.main import Memory, _validate_and_trim_entity_id
+from mem0.memory.main import AsyncMemory, Memory, _validate_and_trim_entity_id
 
 
 @pytest.fixture(autouse=True)
@@ -349,44 +349,69 @@ def test_get_all_can_show_expired_memories(memory_instance):
     assert [memory["memory"] for memory in result["results"]] == ["Expired memory", "Active memory"]
 
 
-def test_no_telemetry_vector_store_when_disabled():
-    """VectorStoreFactory should only be called once (for user data) when telemetry is disabled."""
+@pytest.mark.parametrize("memory_cls", [Memory, AsyncMemory])
+def test_no_extra_vector_store_when_telemetry_enabled(memory_cls):
+    """Telemetry must not open a second vector store (#7665, #7764).
+
+    Nothing reads a telemetry-only store, but opening one locks a shared local Qdrant
+    folder and creates an unused ``mem0migrations`` collection on remote clusters.
+    """
     with (
-        patch("mem0.memory.main.MEM0_TELEMETRY", False),
+        # create=True: main.py no longer reads this flag; before the fix it gated the extra store.
+        patch("mem0.memory.main.MEM0_TELEMETRY", True, create=True),
         patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
         patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
         patch("mem0.utils.factory.LlmFactory") as mock_llm,
-        patch("mem0.memory.telemetry.capture_event"),
+        patch("mem0.memory.main.capture_event"),
     ):
         mock_embedder.create.return_value = Mock()
         mock_vector_store.create.return_value = Mock()
         mock_llm.create.return_value = Mock()
 
-        config = MemoryConfig(version="v1.1")
-        Memory(config)
+        memory = memory_cls(MemoryConfig(version="v1.1"))
 
-        # VectorStoreFactory.create should be called exactly once — for user data only, not telemetry
+        # Only the user-data store; the entity store is created lazily on first use.
         assert mock_vector_store.create.call_count == 1
+        assert not hasattr(memory, "_telemetry_vector_store")
 
 
-def test_telemetry_vector_store_created_when_enabled():
-    """VectorStoreFactory should be called twice (user data + telemetry) when telemetry is enabled."""
+def test_two_local_qdrant_memories_coexist_with_telemetry_enabled(tmp_path):
+    """Two Memory instances on separate local Qdrant paths must both construct (#7665).
+
+    Previously each instance also opened ``<MEM0_DIR>/migrations_qdrant``, a fixed
+    path that local Qdrant locks exclusively, so the second construction raised.
+    """
+    mem0_dir = tmp_path / "mem0_home"
+    mem0_dir.mkdir()
+
+    def make_config(name):
+        return MemoryConfig(
+            vector_store={
+                "provider": "qdrant",
+                "config": {"collection_name": name, "path": str(tmp_path / name), "embedding_model_dims": 8},
+            },
+            history_db_path=str(tmp_path / f"{name}.db"),
+        )
+
     with (
-        patch("mem0.memory.main.MEM0_TELEMETRY", True),
+        patch("mem0.memory.main.MEM0_TELEMETRY", True, create=True),
+        # create=True: main.py no longer imports mem0_dir; before the fix this kept the lock in tmp_path.
+        patch("mem0.memory.main.mem0_dir", str(mem0_dir), create=True),
         patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
-        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
         patch("mem0.utils.factory.LlmFactory") as mock_llm,
-        patch("mem0.memory.telemetry.capture_event"),
+        patch("mem0.memory.main.capture_event"),
     ):
         mock_embedder.create.return_value = Mock()
-        mock_vector_store.create.return_value = Mock()
         mock_llm.create.return_value = Mock()
 
-        config = MemoryConfig(version="v1.1")
-        Memory(config)
+        first = Memory(make_config("first"))
+        second = Memory(make_config("second"))
 
-        # VectorStoreFactory.create should be called twice — user data + telemetry
-        assert mock_vector_store.create.call_count == 2
+    try:
+        assert not (mem0_dir / "migrations_qdrant").exists()
+    finally:
+        for memory in (first, second):
+            memory.vector_store.client.close()
 
 
 # =============================================================================

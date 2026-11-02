@@ -318,7 +318,6 @@ class TestAsyncAddToVectorStoreErrors:
 def _build_memory_instance(mocker, memory_cls):
     _setup_mocks(mocker)
     mocker.patch("mem0.memory.main.SQLiteManager", mocker.MagicMock())
-    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
     memory = memory_cls()
     memory.config = mocker.MagicMock()
     memory.config.custom_instructions = None
@@ -1336,7 +1335,6 @@ class TestAsyncPartialInsertFailure:
 
 
 def test_update_racing_delete_does_not_recreate_memory(mocker, tmp_path):
-    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
     embedder = mocker.MagicMock()
     embedder.embed.return_value = [0.1, 0.2, 0.3, 0.4]
     embedder.embed_batch.side_effect = lambda texts, *a, **k: [[0.1, 0.2, 0.3, 0.4] for _ in texts]
